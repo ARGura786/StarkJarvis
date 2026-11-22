@@ -117,7 +117,7 @@ def ChatBot(Query):
 
             # Send the query to the Groq API.
             completion = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",  # Specify the Groq AI model to use.
+                model="openai/gpt-oss-120b",  # Specify the Groq AI model to use.
                 messages=SystemChatBot + [{"role": "system", "content": RealtimeInformation()}] + messages,  # Include system instructions, real-time info, and chat history.
                 max_tokens=1024,  # Limit the maximum tokens in the response.
                 temperature=0.7,  # Adjust the randomness of the response.
