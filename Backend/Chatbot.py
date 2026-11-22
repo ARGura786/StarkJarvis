@@ -1,8 +1,16 @@
 import json  # Import the json module to handle JSON data.
 from json import load, dump  # Import functions to read and write JSON files.
 import datetime  # Import the datetime module for real-time date and time information.
+import time  # Import time to add a delay between retries.
 import requests  # Import requests to handle request-related exceptions.
-from groq import Groq  # Importing the Groq library to use its API.
+from groq import (  # Import the Groq client and its error types.
+    Groq,
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    BadRequestError,
+    UnprocessableEntityError,
+)
 from dotenv import dotenv_values  # Import dotenv_values to read environment variables from a .env file.
 from pathlib import Path  # Import Path to build reliable paths to the project files.
 
@@ -37,6 +45,19 @@ SystemChatBot = [
 
 # Path to the chat log file.
 CHAT_LOG = BASE_DIR / "Data" / "ChatLog.json"
+
+# Retry configuration for recoverable Groq request failures.
+MAX_RETRIES = 2  # Number of retries after the first attempt.
+RETRY_DELAY = 1  # Seconds to wait between attempts.
+
+# Errors that indicate a permanent problem; retrying them cannot succeed.
+PERMANENT_ERRORS = (
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    BadRequestError,
+    UnprocessableEntityError,
+)
 
 # Attempt to load the chat log from a JSON file.
 try:
@@ -78,50 +99,64 @@ def AnswerModifier(Answer):
 def ChatBot(Query):
     """ This function sends the user's query to the chatbot and returns the AI's response. """
 
-    try:
-        # Load the existing chat log.
-        with open(CHAT_LOG, "r") as f:
-            messages = load(f)
+    # Retry recoverable failures a bounded number of times instead of recursing.
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            # Load the existing chat log. Only reset it when it is unreadable.
+            try:
+                with open(CHAT_LOG, "r") as f:
+                    messages = load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                print("ChatLog.json is empty or corrupted. Initializing with an empty list.")
+                messages = []
+                with open(CHAT_LOG, "w") as f:
+                    dump(messages, f, indent=4)
 
-        # Append the user's query to the messages list.
-        messages.append({"role": "user", "content": f"{Query}"})
+            # Append the user's query to the messages list.
+            messages.append({"role": "user", "content": f"{Query}"})
 
-        # Send the query to the Groq API.
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",  # Specify the Groq AI model to use.
-            messages=SystemChatBot + [{"role": "system", "content": RealtimeInformation()}] + messages,  # Include system instructions, real-time info, and chat history.
-            max_tokens=1024,  # Limit the maximum tokens in the response.
-            temperature=0.7,  # Adjust the randomness of the response.
-            top_p=1,  # Use nucleus sampling to control diversity.
-            stream=True,  # Enable streaming responses.
-            stop=None  # Allow the model to determine when to stop.
-        )
+            # Send the query to the Groq API.
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",  # Specify the Groq AI model to use.
+                messages=SystemChatBot + [{"role": "system", "content": RealtimeInformation()}] + messages,  # Include system instructions, real-time info, and chat history.
+                max_tokens=1024,  # Limit the maximum tokens in the response.
+                temperature=0.7,  # Adjust the randomness of the response.
+                top_p=1,  # Use nucleus sampling to control diversity.
+                stream=True,  # Enable streaming responses.
+                stop=None  # Allow the model to determine when to stop.
+            )
 
-        Answer = ""  # Initialize an empty string to store the AI's response.
+            Answer = ""  # Initialize an empty string to store the AI's response.
 
-        # Process the streamed response chunks.
-        for chunk in completion:
-            if chunk.choices[0].delta.content:  # Check if there's content in the current chunk.
-                Answer += chunk.choices[0].delta.content  # Append the content to the answer.
+            # Process the streamed response chunks.
+            for chunk in completion:
+                if chunk.choices[0].delta.content:  # Check if there's content in the current chunk.
+                    Answer += chunk.choices[0].delta.content  # Append the content to the answer.
 
-        Answer = Answer.replace("</s>", "")  # Clean up any unwanted tokens from the response.
+            Answer = Answer.replace("</s>", "")  # Clean up any unwanted tokens from the response.
 
-        # Append the chatbot's response to the messages list.
-        messages.append({"role": "assistant", "content": Answer})
+            # Append the chatbot's response to the messages list.
+            messages.append({"role": "assistant", "content": Answer})
 
-        # Save the updated chat log to the JSON file.
-        with open(CHAT_LOG, "w") as f:
-            dump(messages, f, indent=4)
+            # Save the updated chat log only after the full response is ready.
+            with open(CHAT_LOG, "w") as f:
+                dump(messages, f, indent=4)
 
-        # Return the formatted response.
-        return AnswerModifier(Answer=Answer)
+            # Return the formatted response.
+            return AnswerModifier(Answer=Answer)
 
-    except Exception as e:
-        # Handle errors by printing the exception and resetting the chat log.
-        print(f"Error: {e}")
-        with open(CHAT_LOG, "w") as f:
-            dump([], f, indent=4)
-        return ChatBot(Query)  # Retry the query after resetting the log.
+        except PERMANENT_ERRORS as e:
+            # Retrying cannot fix these, so stop immediately and keep the saved history.
+            print(f"Error: {e}")
+            return "An error occurred, please try again later."
+
+        except Exception as e:
+            # Preserve the saved history and retry recoverable failures.
+            print(f"Error: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+
+    return "An error occurred, please try again later."
 
 # Main program entry point.
 if __name__ == "__main__":
