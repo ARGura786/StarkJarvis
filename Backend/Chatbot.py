@@ -127,13 +127,23 @@ def ChatBot(Query):
             )
 
             Answer = ""  # Initialize an empty string to store the AI's response.
+            finish_reason = None  # Track why the model stopped generating.
 
             # Process the streamed response chunks.
             for chunk in completion:
-                if chunk.choices[0].delta.content:  # Check if there's content in the current chunk.
-                    Answer += chunk.choices[0].delta.content  # Append the content to the answer.
+                if not chunk.choices:  # Skip chunks that carry no choices.
+                    continue
+                choice = chunk.choices[0]
+                if choice.delta.content:  # Check if there's content in the current chunk.
+                    Answer += choice.delta.content  # Append the content to the answer.
+                if choice.finish_reason:  # Capture the final stop reason.
+                    finish_reason = choice.finish_reason
 
             Answer = Answer.replace("</s>", "")  # Clean up any unwanted tokens from the response.
+
+            if finish_reason == "length":
+                # Do not persist a truncated turn; report it to the caller instead.
+                return AnswerModifier(Answer=Answer) + "\n\n[Response truncated: the model reached the token limit. The chat log was not updated.]"
 
             # Append the chatbot's response to the messages list.
             messages.append({"role": "assistant", "content": Answer})
