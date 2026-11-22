@@ -25,6 +25,7 @@ exa = Exa(api_key=ExaAPIKey)
 
 # Define the system instructions for the chatbot.
 System = f"""Hello, I am {Username}, You are a very accurate and advanced AI chatbot named {Assistantname} which also has real-time up-to-date information from the internet.
+*** Reply in the same language as the user. If the user writes in English, reply in English; otherwise reply in Hindi. ***
 *** Provide Answers In a Professional Way, make sure to add full stops, commas, question marks and use proper grammar.***
 *** Just answer the question from the provided data in a professional way. ***"""
 
