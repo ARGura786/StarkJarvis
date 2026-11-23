@@ -1,237 +1,110 @@
-import asyncio  # Import asyncio to run speech synthesis and playback concurrently.
-import re  # Import re to split responses into sentences.
-import shutil  # Import shutil to clean up temporary audio files.
-import tempfile  # Import tempfile to create a working directory for audio parts.
-import requests  # Import requests to call the Fish Audio text-to-speech API (sync helper).
-import aiohttp  # Import aiohttp for non-blocking Fish Audio requests.
-import pygame  # Import pygame to play the generated audio.
-from dotenv import dotenv_values  # Import dotenv_values to read environment variables from a .env file.
-from pathlib import Path  # Import Path to build reliable paths to the project files.
+import pygame  # Import pygame library for handling audio playback
+import random  # Import random for generating random choices
+import asyncio  # Import asyncio for asynchronous operations
+import edge_tts  # Import edge_tts for text-to-speech functionality
+import os  # Import os for file path handling
+from dotenv import dotenv_values  # Import dotenv for reading environment variables from a .env file
 
-# Base directory of the project (one level above the Backend folder).
-BASE_DIR = Path(__file__).resolve().parent.parent
+# Load environment variables from a .env file
+env_vars = dotenv_values(".env")
+AssistantVoice = env_vars.get("AssistantVoice")  # Get the AssistantVoice from the environment variables
 
-# Load environment variables from the .env file at the project root.
-env_vars = dotenv_values(BASE_DIR / ".env")
 
-# Retrieve the Fish Audio configuration.
-FishAPIKey = env_vars.get("FishAPIKey")
-FishVoiceId = env_vars.get("FishVoiceId")  # Optional voice model ID.
-FishModel = env_vars.get("FishModel") or "s2.1-pro-free"  # Free development TTS model.
-Assistantname = env_vars.get("Assistantname") or "Jarvis"  # Name shown in the chat loop.
+# Asynchronous function to convert text to an audio file
+async def TextToAudioFile(text) -> None:
+    file_path = r"Data\speech.mp3"  # Define the path where the speech file will be saved
 
-# Fish Audio text-to-speech endpoint.
-TTS_URL = "https://api.fish.audio/v1/tts"
+    if os.path.exists(file_path):  # Check if the file already exists
+        os.remove(file_path)  # If it exists, remove it to avoid overwriting errors
 
-# Path where the generated audio is stored.
-OutputFile = BASE_DIR / "Data" / "speech.mp3"
+    # Create the communicate object to generate speech
+    communicate = edge_tts.Communicate(text, AssistantVoice, pitch='+5Hz', rate='+13%')
+    await communicate.save(r'Data\speech.mp3')  # Save the generated speech as an MP3 file
 
-# Build the headers required by the Fish Audio API.
-def _BuildHeaders():
-    return {
-        "Authorization": f"Bearer {FishAPIKey}",
-        "Content-Type": "application/json",
-        "model": FishModel,
-    }
 
-# Build the request body required by the Fish Audio API.
-def _BuildPayload(Text):
-    payload = {
-        "text": str(Text),
-        "format": "mp3",
-    }
+# Function to manage Text-to-Speech (TTS) functionality
+def TTS(Text, func=lambda r=None: True):
+    while True:
+        try:
+            # Convert text to an audio file asynchronously
+            asyncio.run(TextToAudioFile(Text))
 
-    # Use a specific voice when one is configured.
-    if FishVoiceId:
-        payload["reference_id"] = FishVoiceId
+            # Initialize pygame mixer for audio playback
+            pygame.mixer.init()
 
-    return payload
+            # Load the saved audio file into the mixer
+            pygame.mixer.music.load(r"Data\speech.mp3")
 
-# Function to convert text into an audio file using Fish Audio (synchronous).
-def TextToAudioFile(Text):
-    if not FishAPIKey:
-        raise ValueError("FishAPIKey is missing from the .env file.")
+            # Play the audio file
+            pygame.mixer.music.play()
 
-    # Remove the previous audio file, if any.
-    if OutputFile.exists():
-        OutputFile.unlink()
-
-    response = requests.post(
-        TTS_URL,
-        headers=_BuildHeaders(),
-        json=_BuildPayload(Text),
-        timeout=120,
-    )
-
-    # Surface the API's error message instead of a bare status code.
-    if response.status_code != 200:
-        raise RuntimeError(f"Fish Audio TTS failed ({response.status_code}): {response.text[:500]}")
-
-    # Save the generated audio to disk.
-    with open(OutputFile, "wb") as f:
-        f.write(response.content)
-
-    return OutputFile
-
-# Asynchronously fetch the audio for a single piece of text.
-async def _FetchAudio(Session, Text, FilePath):
-    if not FishAPIKey:
-        raise ValueError("FishAPIKey is missing from the .env file.")
-
-    async with Session.post(
-        TTS_URL,
-        headers=_BuildHeaders(),
-        json=_BuildPayload(Text),
-        timeout=aiohttp.ClientTimeout(total=120),
-    ) as response:
-        if response.status != 200:
-            body = await response.text()
-            raise RuntimeError(f"Fish Audio TTS failed ({response.status}): {body[:500]}")
-        data = await response.read()
-
-    FilePath.write_bytes(data)
-    return FilePath
-
-# Split a response into sentences so speech can start as early as possible.
-def _SplitSentences(Text):
-    parts = re.split(r'(?<=[.!?])\s+', str(Text).strip())
-    return [part for part in parts if part.strip()]
-
-# Play an audio file without blocking the event loop.
-def _PlayFile(FilePath, func=lambda: True):
-    if not pygame.mixer.get_init():
-        pygame.mixer.init()
-
-    pygame.mixer.music.load(str(FilePath))
-    pygame.mixer.music.play()
-
-    # Keep playing until the audio ends or the caller asks to stop.
-    while pygame.mixer.music.get_busy():
-        if func() is False:
-            pygame.mixer.music.stop()
-            break
-        pygame.time.Clock().tick(10)
-
-    # Release the file handle so the audio file can be deleted on Windows.
-    try:
-        pygame.mixer.music.unload()
-    except Exception:
-        pass
-
-# Stop playback and release the mixer.
-def _StopPlayback():
-    try:
-        if pygame.mixer.get_init():
-            pygame.mixer.music.stop()
-            pygame.mixer.quit()
-    except Exception:
-        pass
-
-# Function to play the generated audio file (synchronous).
-def PlayAudio(FilePath, func=lambda: True):
-    pygame.mixer.init()
-    try:
-        _PlayFile(FilePath, func)
-    finally:
-        _StopPlayback()
-
-# Speak a response sentence by sentence, synthesizing the next part while the
-# current part is playing so the reply starts almost immediately.
-async def SpeakAsync(Text, func=lambda: True):
-    if not Text or not str(Text).strip():
-        return False
-
-    sentences = _SplitSentences(Text)
-    if not sentences:
-        return False
-
-    work_dir = Path(tempfile.mkdtemp(prefix="jarvis_tts_"))
-    next_audio = None
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            def synthesize(index, sentence):
-                return _FetchAudio(session, sentence, work_dir / f"part_{index}.mp3")
-
-            # Start generating the first sentence right away.
-            next_audio = asyncio.create_task(synthesize(0, sentences[0]))
-
-            for index in range(len(sentences)):
-                audio_path = await next_audio
-
-                # Start generating the next sentence while this one plays.
-                if index + 1 < len(sentences):
-                    next_audio = asyncio.create_task(synthesize(index + 1, sentences[index + 1]))
-
-                await asyncio.to_thread(_PlayFile, audio_path, func)
-                try:
-                    audio_path.unlink(missing_ok=True)
-                except OSError:
-                    pass  # Windows may still hold the handle briefly; temp dir is cleaned later.
-
-                if func() is False:
-                    break
-
-        return True
-    finally:
-        # Cancel any in-flight synthesis so it does not outlive the session.
-        if next_audio is not None and not next_audio.done():
-            next_audio.cancel()
-            try:
-                await next_audio
-            except BaseException:
-                pass
-
-        await asyncio.to_thread(_StopPlayback)
-        shutil.rmtree(work_dir, ignore_errors=True)
-
-# Main text-to-speech function (kept synchronous for existing callers).
-def TextToSpeech(Text, func=lambda: True):
-    if not Text or not str(Text).strip():
-        return False
-
-    try:
-        return asyncio.run(SpeakAsync(Text, func))
-    except Exception as e:
-        print(f"Error in TTS: {e}")
-        return False
-
-# Function to run a continuous voice chat session.
-async def ContinuousChat():
-    # Imported here so the microphone and chat setup only runs when a session starts.
-    from SpeechToText import SpeechRecognition
-    from Chatbot import ChatBot
-
-    print("Voice chat started. Say 'exit' or 'bye' to stop.")
-
-    try:
-        while True:
-            try:
-                # Listen for the user's voice input without blocking the event loop.
-                user_input = await asyncio.to_thread(SpeechRecognition)
-            except Exception as e:
-                print(f"Speech recognition error: {e}")
+            # Wait until the audio playback finishes
+            while pygame.mixer.music.get_busy() == True:
                 continue
 
-            if not user_input:
-                continue
-
-            print(f"You: {user_input}")
-
-            # Stop the session when the user says goodbye.
-            if user_input.lower().strip(" .?!") in {"exit", "quit", "bye", "goodbye"}:
+            # Check if the provided function returns False to stop playback
+            if func() == False:
                 break
 
-            # Generate the reply, then speak it.
-            response = await asyncio.to_thread(ChatBot, user_input)
-            print(f"{Assistantname}: {response}")
-            await SpeakAsync(response)
+            # Stop the audio playback
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+            break
 
-    except KeyboardInterrupt:
-        print("\nVoice chat stopped.")
-    finally:
-        print("Goodbye.")
+        except Exception as e:
+            print(f"Error in TTS: {e}")
+            break
 
-# Main program entry point.
+        finally:
+            try:
+                # Call the provided function with False to signal the end of TTS
+                func(False)
+                pygame.mixer.music.stop()  # Stop the audio playback
+                pygame.mixer.quit()  # Quit the pygame mixer
+
+            except Exception as e:  # Handle any exceptions during cleanup
+                print(f"Error in finally block: {e}")
+
+
+# Function to manage Text-to-Speech with additional responses for long text
+def TextToSpeech(Text, func=lambda r=None: True):
+    Data = str(Text).split(".")  # Split the text by periods into a list of sentences
+
+    # List of predefined responses for cases where the text is too long
+    responses = [
+        "The rest of the result has been printed to the chat screen, kindly check it out sir.",
+        "The rest of the text is now on the chat screen, sir, please check it.",
+        "You can see the rest of the text on the chat screen, sir.",
+        "The remaining part of the text is now on the chat screen, sir.",
+        "Sir, you'll find more text on the chat screen for you to see.",
+        "The rest of the answer is now on the chat screen, sir.",
+        "Sir, please look at the chat screen, the rest of the answer is there.",
+        "You'll find the complete answer on the chat screen, sir.",
+        "The next part of the text is on the chat screen, sir.",
+        "Sir, please check the chat screen for more information.",
+        "There's more text on the chat screen for you, sir.",
+        "Sir, take a look at the chat screen for additional text.",
+        "You'll find more to read on the chat screen, sir.",
+        "Sir, check the chat screen for the rest of the text.",
+        "The chat screen has the rest of the text, sir.",
+        "There's more to see on the chat screen, sir, please look.",
+        "Sir, the chat screen holds the continuation of the text.",
+        "You'll find the complete answer on the chat screen, kindly check it out sir.",
+        "Please review the chat screen for the rest of the text, sir.",
+        "Sir, look at the chat screen for the complete answer.",
+    ]
+
+    # If the text is very long (more than 4 sentences and 250 characters), add a response message
+    if len(Data) > 4 and len(Text) >= 250:
+        TTS(".".join(Data[:2]) + "." + random.choice(responses), func)
+
+    # Otherwise, just play the whole text
+    else:
+        TTS(Text, func)
+
+
+# Main execution loop
 if __name__ == "__main__":
-    asyncio.run(ContinuousChat())
+    while True:
+        # Prompt user for input and pass it to TextToSpeech function
+        TextToSpeech(input("Enter the text: "))

@@ -1,6 +1,6 @@
 import re  # Import re to detect Hindi (Devanagari) text.
 import speech_recognition as sr  # Import speech_recognition for direct microphone capture.
-from concurrent.futures import ThreadPoolExecutor  # Import ThreadPoolExecutor to try languages in parallel.
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait  # Import a pool to try languages in parallel.
 from dotenv import dotenv_values  # Import dotenv_values to read environment variables from a .env file.
 from pathlib import Path  # Import Path to build reliable paths to the project files.
 
@@ -30,6 +30,16 @@ RECOGNITION_LANGUAGES = ["en-US", "hi-IN"]
 # Create a reusable recognizer instance.
 recognizer = sr.Recognizer()
 recognizer.dynamic_energy_threshold = True
+# Wait through natural pauses instead of ending the prompt at the first short gap.
+# The old 0.45s/0.3s values cut users off mid-sentence.
+recognizer.pause_threshold = 1.0
+recognizer.non_speaking_duration = 0.7
+# Bound each recognition request so a stalled call cannot hang the pool.
+recognizer.operation_timeout = 10
+
+# One pool for every recognition, so threads are not created on each utterance.
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="stt")
+_ambient_ready = False
 
 # Function to set the assistant's status by writing it to a file.
 def SetAssistantStatus(Status):
@@ -107,14 +117,21 @@ def _ChooseResult(Results):
 # Recognize speech in English and Hindi, then choose the best transcript.
 def _Recognize(Audio):
     results = {}
+    futures = {
+        _executor.submit(recognizer.recognize_google, Audio, language=language): language
+        for language in RECOGNITION_LANGUAGES
+    }
 
-    with ThreadPoolExecutor(max_workers=len(RECOGNITION_LANGUAGES)) as pool:
-        futures = {
-            language: pool.submit(recognizer.recognize_google, Audio, language=language)
-            for language in RECOGNITION_LANGUAGES
-        }
-
-        for language, future in futures.items():
+    pending = set(futures)
+    # Take results as they arrive, but do not let the slower language add a long wait
+    # once one language already produced text.
+    while pending:
+        grace = 0.3 if any(results.values()) else 15
+        done, pending = wait(pending, timeout=grace, return_when=FIRST_COMPLETED)
+        if not done:
+            break
+        for future in done:
+            language = futures[future]
             try:
                 results[language] = future.result().strip()
             except sr.UnknownValueError:
@@ -125,13 +142,31 @@ def _Recognize(Audio):
 
     return _ChooseResult(results)
 
+# Calibrate the microphone once, before the first prompt, so the user's first
+# words are not treated as background noise.
+def PrepareMicrophone():
+    global _ambient_ready
+    if _ambient_ready:
+        return True
+    try:
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        _ambient_ready = True
+        return True
+    except Exception as e:
+        print(f"Microphone error: {e}")
+        return False
+
 # Function to perform speech recognition using the microphone.
 def SpeechRecognition():
+    if not _ambient_ready:
+        PrepareMicrophone()
+
     try:
         with sr.Microphone() as source:
             SetAssistantStatus("Listening...")
-            recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            Audio = recognizer.listen(source, timeout=10, phrase_time_limit=15)
+            # Allow a long prompt: wait 15s for speech to start and record up to 45s.
+            Audio = recognizer.listen(source, timeout=15, phrase_time_limit=45)
     except sr.WaitTimeoutError:
         # No speech was detected within the timeout.
         SetAssistantStatus("")
