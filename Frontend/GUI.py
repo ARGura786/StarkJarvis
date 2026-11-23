@@ -4,6 +4,8 @@ from PyQt5.QtCore import Qt, QSize, QTimer
 from dotenv import dotenv_values
 import sys
 import os
+import threading
+import time
 
 env_vars = dotenv_values(".env")
 Assistantname = env_vars.get("Assistantname")
@@ -11,6 +13,10 @@ current_dir = os.getcwd()
 old_chat_message = ""
 TempDirPath = rf"{current_dir}\Frontend\Files"
 GraphicsDirPath = rf"{current_dir}\Frontend\Graphics"
+
+# Make the Backend package importable when the GUI is started from the Frontend folder.
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
 
 
 def AnswerModifier(Answer):
@@ -82,6 +88,55 @@ def TempDirectoryPath(Filename):
 def ShowTextToScreen(Text):
     with open(rf'{TempDirPath}\Responses.data', "w", encoding='utf-8') as file:
         file.write(Text)
+
+
+# Background listener: follows the real microphone state written to Mic.data.
+# While the mic is on it keeps recording and sends the recognised text to the chat,
+# so the button actually turns the microphone on and off.
+_mic_thread = None
+_mic_thread_lock = threading.Lock()
+
+
+def _MicrophoneLoop():
+    # Imported here so the GUI still starts when the audio stack is unavailable.
+    try:
+        from Backend.SpeechToText import SpeechRecognition
+    except Exception as e:
+        print(f"Speech recognition unavailable: {e}")
+        SetAssistantStatus("")
+        return
+
+    was_listening = False
+
+    while True:
+        try:
+            if GetMicrophoneStatus() != "True":
+                if was_listening:
+                    SetAssistantStatus("")
+                    was_listening = False
+                time.sleep(0.3)
+                continue
+
+            was_listening = True
+            Text = SpeechRecognition()
+
+            if Text:
+                # Show what the microphone heard on the chat screen.
+                ShowTextToScreen(f"You: {Text}")
+
+        except Exception as e:
+            print(f"Microphone loop error: {e}")
+            SetAssistantStatus("")
+            time.sleep(1)
+
+
+def StartMicrophoneListener():
+    global _mic_thread
+    with _mic_thread_lock:
+        if _mic_thread is not None and _mic_thread.is_alive():
+            return
+        _mic_thread = threading.Thread(target=_MicrophoneLoop, name="microphone-listener", daemon=True)
+        _mic_thread.start()
 
 
 class ChatSection(QWidget):
@@ -249,9 +304,11 @@ class InitialScreen(QWidget):
         if self.toggled:
             self.load_icon(GraphicsDirectoryPath('Mic_off.png'), 60, 60)
             MicButtonInitialed()
+            SetAssistantStatus("")
         else:
             self.load_icon(GraphicsDirectoryPath('Mic_on.png'), 60, 60)
             MicButtonClosed()
+            SetAssistantStatus("Listening...")
 
         self.toggled = not self.toggled
 
@@ -405,6 +462,7 @@ class MainWindow(QMainWindow):
 
 def GraphicalUserInterface():
     app = QApplication(sys.argv)
+    StartMicrophoneListener()
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
