@@ -1,11 +1,7 @@
-from selenium import webdriver  # Import the Selenium WebDriver for browser automation.
-from selenium.webdriver.common.by import By  # Import By to locate elements in the page.
-from selenium.webdriver.chrome.service import Service  # Import Service to manage the Chrome driver.
-from selenium.webdriver.chrome.options import Options  # Import Options to configure Chrome.
-from webdriver_manager.chrome import ChromeDriverManager  # Import ChromeDriverManager to install the driver.
+import re  # Import re to detect Hindi (Devanagari) text.
+import speech_recognition as sr  # Import speech_recognition for direct microphone capture.
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait  # Import a pool to try languages in parallel.
 from dotenv import dotenv_values  # Import dotenv_values to read environment variables from a .env file.
-import os  # Import os for file and path operations.
-import mtranslate as mt  # Import mtranslate for translating recognized text.
 from pathlib import Path  # Import Path to build reliable paths to the project files.
 
 # Base directory of the project (one level above the Backend folder).
@@ -15,70 +11,35 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 env_vars = dotenv_values(BASE_DIR / ".env")
 
 # Get the input language setting from the environment variables.
-InputLanguage = env_vars.get("InputLanguage", "en")
-
-# Define the HTML code for the speech recognition interface.
-HtmlCode = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <title>Speech Recognition</title>
-</head>
-<body>
-    <button id="start" onclick="startRecognition()">Start Recognition</button>
-    <button id="end" onclick="stopRecognition()">Stop Recognition</button>
-    <p id="output"></p>
-    <script>
-        const output = document.getElementById('output');
-        let recognition;
-
-        function startRecognition() {
-            recognition = new webkitSpeechRecognition() || new SpeechRecognition();
-            recognition.lang = '';
-            recognition.continuous = true;
-
-            recognition.onresult = function(event) {
-                const transcript = event.results[event.results.length - 1][0].transcript;
-                output.textContent += transcript;
-            };
-
-            recognition.onend = function() {
-                recognition.start();
-            };
-            recognition.start();
-        }
-
-        function stopRecognition() {
-            recognition.stop();
-            output.innerHTML = "";
-        }
-    </script>
-</body>
-</html>'''
-
-# Replace the language setting in the HTML code with the input language from the environment variables.
-HtmlCode = str(HtmlCode).replace("recognition.lang = '';", f"recognition.lang = '{InputLanguage}';")
-
-# Write the modified HTML code to a file.
-with open(BASE_DIR / "Data" / "Voice.html", "w") as f:
-    f.write(HtmlCode)
-
-# Generate the file URI for the HTML file.
-Link = (BASE_DIR / "Data" / "Voice.html").as_uri()
-
-# Set Chrome options for the WebDriver.
-chrome_options = Options()
-user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.142.86 Safari/537.36"
-chrome_options.add_argument(f"user-agent={user_agent}")
-chrome_options.add_argument("--use-fake-ui-for-media-stream")
-chrome_options.add_argument("--use-fake-device-for-media-stream")
-chrome_options.add_argument("--headless=new")
-
-# Install and start the Chrome driver.
-service = Service(ChromeDriverManager().install())
-driver = webdriver.Chrome(service=service, options=chrome_options)
+InputLanguage = env_vars.get("InputLanguage") or "en"
 
 # Define the path for temporary files.
 TempDirPath = BASE_DIR / "Frontend" / "Files"
+
+# Map short language names to the codes used by the recognizer.
+LANGUAGE_MAP = {
+    "en": "en-US",
+    "english": "en-US",
+    "hi": "hi-IN",
+    "hindi": "hi-IN",
+}
+
+# Languages tried for every recording (English and Hindi).
+RECOGNITION_LANGUAGES = ["en-US", "hi-IN"]
+
+# Create a reusable recognizer instance.
+recognizer = sr.Recognizer()
+recognizer.dynamic_energy_threshold = True
+# Wait through natural pauses instead of ending the prompt at the first short gap.
+# The old 0.45s/0.3s values cut users off mid-sentence.
+recognizer.pause_threshold = 1.0
+recognizer.non_speaking_duration = 0.7
+# Bound each recognition request so a stalled call cannot hang the pool.
+recognizer.operation_timeout = 10
+
+# One pool for every recognition, so threads are not created on each utterance.
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="stt")
+_ambient_ready = False
 
 # Function to set the assistant's status by writing it to a file.
 def SetAssistantStatus(Status):
@@ -106,41 +67,128 @@ def QueryModifier(Query):
 
     return new_query.capitalize()
 
-# Function to translate text into English using the mtranslate library.
-def UniversalTranslator(Text):
-    english_translation = mt.translate(Text, "en", "auto")
-    return english_translation
+# Common words used to guess which language the user actually spoke.
+ENGLISH_HINTS = {
+    "a", "am", "an", "and", "are", "can", "close", "could", "date", "did",
+    "do", "does", "evening", "give", "good", "hello", "help", "hey", "hi",
+    "how", "i", "is", "it", "make", "me", "morning", "music", "my", "name",
+    "night", "no", "ok", "okay", "open", "play", "please", "search", "should",
+    "stop", "tell", "thank", "thanks", "the", "time", "to", "today", "tomorrow",
+    "weather", "what", "what's", "when", "where", "which", "who", "why",
+    "would", "yes", "you", "your",
+}
 
-# Function to perform speech recognition using the browser.
+HINDI_HINTS = {
+    "अच्छा", "आज", "आप", "कल", "कहाँ", "कहां", "काम", "कितना", "कितनी",
+    "कैसे", "कौन", "क्या", "क्यों", "कब", "खोलो", "गाना", "चलाओ", "जी",
+    "ठीक", "तुम", "दोस्त", "धन्यवाद", "नमस्ते", "नमस्कार", "नहीं", "बताओ",
+    "बताइए", "बंद", "भाई", "मदद", "मैं", "मौसम", "समय", "हाँ", "हां", "है",
+    "हैं", "हूँ", "हूं", "शुक्रिया",
+}
+
+# Count how many words in the text are known words of a language.
+def _HintScore(Text, Hints):
+    words = re.findall(r"[a-z']+|[\u0900-\u097F]+", str(Text).lower())
+    return sum(1 for word in words if word in Hints)
+
+# Pick the transcript that looks like the language the user actually spoke.
+def _ChooseResult(Results):
+    english = Results.get("en-US", "")
+    hindi = Results.get("hi-IN", "")
+
+    if not english:
+        return hindi
+    if not hindi:
+        return english
+
+    english_score = _HintScore(english, ENGLISH_HINTS)
+    hindi_score = _HintScore(hindi, HINDI_HINTS)
+
+    if hindi_score > english_score:
+        return hindi
+    if english_score > hindi_score:
+        return english
+
+    # Neither transcript contains known words: use the configured language.
+    if str(InputLanguage).lower().startswith("hi"):
+        return hindi
+    return english
+
+# Recognize speech in English and Hindi, then choose the best transcript.
+def _Recognize(Audio):
+    results = {}
+    futures = {
+        _executor.submit(recognizer.recognize_google, Audio, language=language): language
+        for language in RECOGNITION_LANGUAGES
+    }
+
+    pending = set(futures)
+    # Take results as they arrive, but do not let the slower language add a long wait
+    # once one language already produced text.
+    while pending:
+        grace = 0.3 if any(results.values()) else 15
+        done, pending = wait(pending, timeout=grace, return_when=FIRST_COMPLETED)
+        if not done:
+            break
+        for future in done:
+            language = futures[future]
+            try:
+                results[language] = future.result().strip()
+            except sr.UnknownValueError:
+                results[language] = ""
+            except sr.RequestError as e:
+                print(f"Speech recognition service error: {e}")
+                results[language] = ""
+
+    return _ChooseResult(results)
+
+# Calibrate the microphone once, before the first prompt, so the user's first
+# words are not treated as background noise.
+def PrepareMicrophone():
+    global _ambient_ready
+    if _ambient_ready:
+        return True
+    try:
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        _ambient_ready = True
+        return True
+    except Exception as e:
+        print(f"Microphone error: {e}")
+        return False
+
+# Function to perform speech recognition using the microphone.
 def SpeechRecognition():
-    # Open the HTML file in the browser.
-    driver.get(Link)
-    # Start speech recognition by clicking the start button.
-    driver.find_element(by=By.ID, value="start").click()
+    if not _ambient_ready:
+        PrepareMicrophone()
 
-    while True:
-        try:
-            # Get the recognized text from the HTML output element.
-            Text = driver.find_element(by=By.ID, value="output").text
+    try:
+        with sr.Microphone() as source:
+            SetAssistantStatus("Listening...")
+            # Allow a long prompt: wait 15s for speech to start and record up to 45s.
+            Audio = recognizer.listen(source, timeout=15, phrase_time_limit=45)
+    except sr.WaitTimeoutError:
+        # No speech was detected within the timeout.
+        SetAssistantStatus("")
+        return ""
+    except OSError as e:
+        print(f"Microphone error: {e}")
+        SetAssistantStatus("")
+        return ""
 
-            if Text:
-                # Stop recognition by clicking the stop button.
-                driver.find_element(by=By.ID, value="end").click()
+    SetAssistantStatus("Recognizing...")
+    Text = _Recognize(Audio)
 
-                # If the input language is English, return the modified query.
-                if InputLanguage.lower() == "en" or "en" in InputLanguage.lower():
-                    return QueryModifier(Text)
-                else:
-                    # If the input language is not English, translate the text and return it.
-                    SetAssistantStatus("Translating...")
-                    return QueryModifier(UniversalTranslator(Text))
+    if not Text:
+        SetAssistantStatus("")
+        return ""
 
-        except Exception:
-            pass
+    return QueryModifier(Text)
 
 # Main execution block.
 if __name__ == "__main__":
     while True:
         # Continuously perform speech recognition and print the recognized text.
         Text = SpeechRecognition()
-        print(Text)
+        if Text:
+            print(Text)

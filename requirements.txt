@@ -16,3 +16,6 @@ edge-tts
 PyQt5
 webdriver-manager
 exa-py
+aiohttp
+SpeechRecognition
+PyAudio
